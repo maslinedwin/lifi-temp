@@ -9,6 +9,8 @@ from urllib.parse import urlparse, parse_qs
 from http import HTTPStatus
 from datetime import datetime
 from get_large_transactions import fetch_and_process_data
+from get_large_transactions_db import fetch_and_process_data_db
+from database import LiFiDatabase
 
 # Global variables for tracking progress
 current_process = None
@@ -20,9 +22,16 @@ process_start_time = None
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def fetch_with_progress_tracking(config_params=None):
+# Database instance
+db = LiFiDatabase()
+
+def fetch_with_progress_tracking(config_params=None, use_database=True):
     """Wrapper function to track progress of the fetch process."""
     global process_status, process_progress, process_start_time
+
+    def progress_callback(message, current=0, total=0):
+        global process_progress
+        process_progress = {"current": current, "total": total, "message": message}
 
     try:
         process_status = "running"
@@ -30,11 +39,16 @@ def fetch_with_progress_tracking(config_params=None):
         process_progress = {"current": 0, "total": 0, "message": "Starting transaction fetch..."}
         logger.info("Starting transaction fetch process")
 
-        # Call the actual fetch function
-        fetch_and_process_data()
+        if use_database:
+            # Use the new database-enabled fetch function
+            count = fetch_and_process_data_db(progress_callback)
+            process_progress["message"] = f"Database fetch completed! Saved {count} transactions."
+        else:
+            # Use the legacy Excel-only function
+            fetch_and_process_data()
+            process_progress["message"] = "Excel-only fetch completed successfully"
 
         process_status = "completed"
-        process_progress["message"] = "Transaction fetch completed successfully"
         logger.info("Transaction fetch completed successfully")
 
     except Exception as e:
@@ -80,17 +94,28 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 <h1>🚀 LiFi Large Transactions Fetcher</h1>
                 <p>Welcome to the enhanced LiFi transaction analysis tool!</p>
 
-                <h2>📊 Main Operations:</h2>
+                <h2>📊 Data Collection:</h2>
                 <div class="endpoint">
-                    <a href="/rebuild">/rebuild</a> - 🔄 Rebuild Excel file with latest BTC transactions
+                    <a href="/rebuild">/rebuild</a> - 🔄 Fetch latest transactions to database + Excel
                 </div>
                 <div class="endpoint">
-                    <a href="/fetch">/fetch</a> - 📥 Start fetching large BTC transactions (legacy)
+                    <a href="/fetch">/fetch</a> - 📥 Legacy Excel-only fetch (old method)
+                </div>
+
+                <h2>🗄️ Database Operations:</h2>
+                <div class="endpoint">
+                    <a href="/data/stats">/data/stats</a> - 📈 Database statistics and analytics
+                </div>
+                <div class="endpoint">
+                    <a href="/data/view">/data/view</a> - 👁️ View transactions with filtering
+                </div>
+                <div class="endpoint">
+                    <a href="/data/export">/data/export</a> - 💾 Export data (Excel, JSON, CSV)
                 </div>
 
                 <h2>📈 Monitoring:</h2>
                 <div class="endpoint">
-                    <a href="/status">/status</a> - 📊 Check detailed process status and file information
+                    <a href="/status">/status</a> - 📊 System status (files + database)
                 </div>
                 <div class="endpoint">
                     <a href="/progress">/progress</a> - ⏱️ Real-time progress tracking (JSON)
@@ -98,10 +123,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
                 <h2>🛠️ Management:</h2>
                 <div class="endpoint">
-                    <a href="/clear">/clear</a> - 🗑️ Delete existing Excel file and start fresh
+                    <a href="/clear">/clear</a> - 🗑️ Clear files and database
                 </div>
                 <div class="endpoint">
-                    <a href="/download">/download</a> - 💾 Download the latest results (if available)
+                    <a href="/download">/download</a> - 📁 File download information
                 </div>
 
                 <h2>ℹ️ System Info:</h2>
@@ -198,12 +223,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             msg = json.dumps(progress_data, indent=2)
 
         elif path == '/clear':
-            # Delete existing Excel file
+            # Delete existing Excel file and clear database
             output_file = "txns_2023_to_2025.xlsx"
             resume_file = "resume_cursor.txt"
+            clear_db = query_params.get('database', ['yes'])[0].lower() == 'yes'
 
             try:
                 files_deleted = []
+                actions_performed = []
+
+                # Clear files
                 if os.path.exists(output_file):
                     os.remove(output_file)
                     files_deleted.append(output_file)
@@ -211,19 +240,30 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     os.remove(resume_file)
                     files_deleted.append(resume_file)
 
-                if files_deleted:
-                    logger.info(f"Cleared files: {', '.join(files_deleted)}")
+                # Clear database if requested
+                if clear_db:
+                    stats_before = db.get_statistics()
+                    db.clear_database()
+                    actions_performed.append(f"Database cleared ({stats_before['total_transactions']} transactions removed)")
+
+                if files_deleted or actions_performed:
+                    logger.info(f"Cleared files: {', '.join(files_deleted)}, Actions: {', '.join(actions_performed)}")
                     msg = f'''
                     <html>
                     <body>
-                        <h2>🗑️ Files Cleared</h2>
-                        <p>Successfully deleted the following files:</p>
+                        <h2>🗑️ Cleanup Complete</h2>
+                        <h3>Files Deleted:</h3>
                         <ul>
-                            {''.join(f'<li>{file}</li>' for file in files_deleted)}
+                            {''.join(f'<li>{file}</li>' for file in files_deleted) if files_deleted else '<li>No files to delete</li>'}
+                        </ul>
+                        <h3>Database Actions:</h3>
+                        <ul>
+                            {''.join(f'<li>{action}</li>' for action in actions_performed) if actions_performed else '<li>Database not cleared</li>'}
                         </ul>
                         <p>You can now start a fresh rebuild.</p>
                         <p>
                             <a href="/rebuild">🔄 Start Rebuild</a> |
+                            <a href="/data/stats">📊 Check Database</a> |
                             <a href="/">🏠 Back to Home</a>
                         </p>
                     </body>
@@ -233,9 +273,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     msg = '''
                     <html>
                     <body>
-                        <h2>ℹ️ No Files to Clear</h2>
-                        <p>No Excel or resume files found to delete.</p>
-                        <p><a href="/">🏠 Back to Home</a></p>
+                        <h2>ℹ️ Nothing to Clear</h2>
+                        <p>No files or data found to clear.</p>
+                        <p>
+                            <a href="/clear?database=yes">🗑️ Force Clear Database</a> |
+                            <a href="/">🏠 Back to Home</a>
+                        </p>
                     </body>
                     </html>
                     '''
@@ -246,6 +289,372 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 <body>
                     <h2>❌ Error Clearing Files</h2>
                     <p>Error: {str(e)}</p>
+                    <p><a href="/">🏠 Back to Home</a></p>
+                </body>
+                </html>
+                '''
+
+        elif path.startswith('/data/'):
+            # Handle database-related endpoints
+            if path == '/data/stats':
+                # Database statistics endpoint
+                try:
+                    stats = db.get_statistics()
+                    db_info = db.get_database_info()
+
+                    msg = f'''
+                    <html>
+                    <head>
+                        <title>Database Statistics - LiFi Fetcher</title>
+                        <style>
+                            body {{ font-family: Arial, sans-serif; margin: 40px; }}
+                            .stats-card {{
+                                border: 1px solid #ddd;
+                                border-radius: 8px;
+                                padding: 20px;
+                                margin: 15px 0;
+                                background-color: #f8f9fa;
+                            }}
+                            .metric {{ display: flex; justify-content: space-between; margin: 10px 0; }}
+                            .metric-label {{ font-weight: bold; }}
+                            .metric-value {{ color: #007bff; }}
+                            table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
+                            th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
+                            th {{ background-color: #f2f2f2; }}
+                        </style>
+                    </head>
+                    <body>
+                        <h1>📊 Database Statistics</h1>
+
+                        <div class="stats-card">
+                            <h3>📋 Overview</h3>
+                            <div class="metric">
+                                <span class="metric-label">Total Transactions:</span>
+                                <span class="metric-value">{stats['total_transactions']:,}</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-label">Total Volume (USD):</span>
+                                <span class="metric-value">${stats['total_volume_usd']:,.2f}</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-label">Recent Transactions (24h):</span>
+                                <span class="metric-value">{stats['recent_transactions_24h']:,}</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-label">Date Range:</span>
+                                <span class="metric-value">{stats['date_range']['earliest']} to {stats['date_range']['latest']}</span>
+                            </div>
+                        </div>
+
+                        <div class="stats-card">
+                            <h3>🪙 Top Tokens</h3>
+                            <table>
+                                <tr><th>Token</th><th>Transactions</th><th>Volume (USD)</th></tr>
+                                {''.join(f'<tr><td>{token["token_symbol"]}</td><td>{token["count"]:,}</td><td>${token["total_volume"] or 0:,.2f}</td></tr>' for token in stats['top_tokens'])}
+                            </table>
+                        </div>
+
+                        <div class="stats-card">
+                            <h3>⛓️ Top Chains</h3>
+                            <table>
+                                <tr><th>Chain</th><th>Transactions</th><th>Volume (USD)</th></tr>
+                                {''.join(f'<tr><td>{chain["chain_name"]}</td><td>{chain["count"]:,}</td><td>${chain["total_volume"] or 0:,.2f}</td></tr>' for chain in stats['top_chains'])}
+                            </table>
+                        </div>
+
+                        <div class="stats-card">
+                            <h3>💾 Database File Info</h3>
+                            <div class="metric">
+                                <span class="metric-label">File Size:</span>
+                                <span class="metric-value">{db_info['file_size_mb']} MB</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-label">Last Modified:</span>
+                                <span class="metric-value">{db_info['last_modified']}</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-label">File Path:</span>
+                                <span class="metric-value">{db_info['file_path']}</span>
+                            </div>
+                        </div>
+
+                        <p style="margin-top: 30px;">
+                            <a href="/data/view">👁️ View Data</a> |
+                            <a href="/data/export">💾 Export Data</a> |
+                            <a href="/">🏠 Home</a>
+                        </p>
+                    </body>
+                    </html>
+                    '''
+                except Exception as e:
+                    logger.error(f"Error getting database statistics: {e}")
+                    msg = f'''
+                    <html>
+                    <body>
+                        <h2>❌ Database Error</h2>
+                        <p>Error retrieving statistics: {str(e)}</p>
+                        <p><a href="/">🏠 Back to Home</a></p>
+                    </body>
+                    </html>
+                    '''
+
+            elif path == '/data/view':
+                # View transactions with filtering
+                try:
+                    # Parse query parameters for filtering
+                    token_symbol = query_params.get('token', [None])[0]
+                    min_usd = query_params.get('min_usd', [None])[0]
+                    max_usd = query_params.get('max_usd', [None])[0]
+                    limit = int(query_params.get('limit', ['100'])[0])
+
+                    # Build filters
+                    filters = {'limit': limit}
+                    if token_symbol:
+                        filters['token_symbol'] = token_symbol
+                    if min_usd:
+                        filters['min_usd'] = float(min_usd)
+                    if max_usd:
+                        filters['max_usd'] = float(max_usd)
+
+                    transactions = db.get_transactions(**filters)
+
+                    # Create filter form
+                    filter_form = f'''
+                    <form method="GET" style="background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 15px 0;">
+                        <h3>🔍 Filter Transactions</h3>
+                        <table>
+                            <tr>
+                                <td>Token Symbol:</td>
+                                <td><input type="text" name="token" value="{token_symbol or ''}" placeholder="e.g., BTC, ETH"></td>
+                            </tr>
+                            <tr>
+                                <td>Min USD Amount:</td>
+                                <td><input type="number" name="min_usd" value="{min_usd or ''}" step="0.01"></td>
+                            </tr>
+                            <tr>
+                                <td>Max USD Amount:</td>
+                                <td><input type="number" name="max_usd" value="{max_usd or ''}" step="0.01"></td>
+                            </tr>
+                            <tr>
+                                <td>Limit:</td>
+                                <td><input type="number" name="limit" value="{limit}" min="1" max="1000"></td>
+                            </tr>
+                        </table>
+                        <button type="submit">Apply Filters</button>
+                        <a href="/data/view">Clear</a>
+                    </form>
+                    '''
+
+                    # Create transaction table
+                    if transactions:
+                        table_rows = ''
+                        for tx in transactions:
+                            table_rows += f'''
+                            <tr>
+                                <td>{tx['transaction_id'][:10]}...</td>
+                                <td>{tx['sending_token'] or 'N/A'}</td>
+                                <td>${tx['sending_amount_usd'] or 0:.2f}</td>
+                                <td>{tx['receiving_token'] or 'N/A'}</td>
+                                <td>${tx['receiving_amount_usd'] or 0:.2f}</td>
+                                <td>{tx['tool']}</td>
+                                <td>{tx['sending_timestamp'][:19] if tx['sending_timestamp'] else 'N/A'}</td>
+                            </tr>
+                            '''
+
+                        transaction_table = f'''
+                        <table style="width: 100%; border-collapse: collapse;">
+                            <thead>
+                                <tr style="background: #f2f2f2;">
+                                    <th>TX ID</th>
+                                    <th>Sending Token</th>
+                                    <th>Sending USD</th>
+                                    <th>Receiving Token</th>
+                                    <th>Receiving USD</th>
+                                    <th>Tool</th>
+                                    <th>Timestamp</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {table_rows}
+                            </tbody>
+                        </table>
+                        '''
+                    else:
+                        transaction_table = '<p>No transactions found with the current filters.</p>'
+
+                    msg = f'''
+                    <html>
+                    <head>
+                        <title>View Transactions - LiFi Fetcher</title>
+                        <style>
+                            body {{ font-family: Arial, sans-serif; margin: 40px; }}
+                            table {{ width: 100%; border-collapse: collapse; }}
+                            th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
+                            th {{ background-color: #f2f2f2; }}
+                            input {{ padding: 5px; margin: 2px; }}
+                            button {{ padding: 8px 15px; background: #007bff; color: white; border: none; border-radius: 3px; }}
+                        </style>
+                    </head>
+                    <body>
+                        <h1>👁️ View Transactions</h1>
+
+                        {filter_form}
+
+                        <h3>📊 Results ({len(transactions)} transactions)</h3>
+                        {transaction_table}
+
+                        <p style="margin-top: 30px;">
+                            <a href="/data/stats">📈 Statistics</a> |
+                            <a href="/data/export">💾 Export</a> |
+                            <a href="/">🏠 Home</a>
+                        </p>
+                    </body>
+                    </html>
+                    '''
+
+                except Exception as e:
+                    logger.error(f"Error viewing transactions: {e}")
+                    msg = f'''
+                    <html>
+                    <body>
+                        <h2>❌ Error</h2>
+                        <p>Error viewing transactions: {str(e)}</p>
+                        <p><a href="/">🏠 Back to Home</a></p>
+                    </body>
+                    </html>
+                    '''
+
+            elif path == '/data/export':
+                # Export data in various formats
+                try:
+                    export_format = query_params.get('format', [None])[0]
+                    token_symbol = query_params.get('token', [None])[0]
+
+                    if export_format:
+                        # Perform export
+                        filters = {}
+                        if token_symbol:
+                            filters['token_symbol'] = token_symbol
+
+                        if export_format == 'excel':
+                            filename = db.export_to_excel(filters=filters)
+                            msg = f'''
+                            <html>
+                            <body>
+                                <h2>✅ Excel Export Complete</h2>
+                                <p>File created: {filename}</p>
+                                <p><a href="/data/export">Back to Export</a> | <a href="/">🏠 Home</a></p>
+                            </body>
+                            </html>
+                            '''
+                        elif export_format == 'json':
+                            filename = db.export_to_json(filters=filters)
+                            msg = f'''
+                            <html>
+                            <body>
+                                <h2>✅ JSON Export Complete</h2>
+                                <p>File created: {filename}</p>
+                                <p><a href="/data/export">Back to Export</a> | <a href="/">🏠 Home</a></p>
+                            </body>
+                            </html>
+                            '''
+                        elif export_format == 'csv':
+                            filename = db.export_to_csv(filters=filters)
+                            msg = f'''
+                            <html>
+                            <body>
+                                <h2>✅ CSV Export Complete</h2>
+                                <p>File created: {filename}</p>
+                                <p><a href="/data/export">Back to Export</a> | <a href="/">🏠 Home</a></p>
+                            </body>
+                            </html>
+                            '''
+                        else:
+                            raise ValueError(f"Unsupported format: {export_format}")
+
+                    else:
+                        # Show export options
+                        msg = '''
+                        <html>
+                        <head>
+                            <title>Export Data - LiFi Fetcher</title>
+                            <style>
+                                body { font-family: Arial, sans-serif; margin: 40px; }
+                                .export-option {
+                                    border: 1px solid #ddd;
+                                    border-radius: 8px;
+                                    padding: 20px;
+                                    margin: 15px 0;
+                                    background-color: #f8f9fa;
+                                }
+                                .export-button {
+                                    background: #007bff;
+                                    color: white;
+                                    padding: 10px 20px;
+                                    text-decoration: none;
+                                    border-radius: 5px;
+                                    margin: 5px;
+                                    display: inline-block;
+                                }
+                            </style>
+                        </head>
+                        <body>
+                            <h1>💾 Export Transaction Data</h1>
+
+                            <div class="export-option">
+                                <h3>📊 Excel Export</h3>
+                                <p>Export to Excel spreadsheet (.xlsx) - compatible with Excel, LibreOffice, Google Sheets</p>
+                                <a href="/data/export?format=excel" class="export-button">Export All to Excel</a>
+                                <a href="/data/export?format=excel&token=BTC" class="export-button">Export BTC Only</a>
+                            </div>
+
+                            <div class="export-option">
+                                <h3>📄 JSON Export</h3>
+                                <p>Export to JSON format - perfect for API integration and data analysis</p>
+                                <a href="/data/export?format=json" class="export-button">Export All to JSON</a>
+                                <a href="/data/export?format=json&token=ETH" class="export-button">Export ETH Only</a>
+                            </div>
+
+                            <div class="export-option">
+                                <h3>📋 CSV Export</h3>
+                                <p>Export to CSV format - universal format for data analysis tools</p>
+                                <a href="/data/export?format=csv" class="export-button">Export All to CSV</a>
+                                <a href="/data/export?format=csv&token=USDC" class="export-button">Export USDC Only</a>
+                            </div>
+
+                            <p style="margin-top: 30px;">
+                                <a href="/data/stats">📈 Statistics</a> |
+                                <a href="/data/view">👁️ View Data</a> |
+                                <a href="/">🏠 Home</a>
+                            </p>
+                        </body>
+                        </html>
+                        '''
+
+                except Exception as e:
+                    logger.error(f"Error exporting data: {e}")
+                    msg = f'''
+                    <html>
+                    <body>
+                        <h2>❌ Export Error</h2>
+                        <p>Error: {str(e)}</p>
+                        <p><a href="/data/export">Try Again</a> | <a href="/">🏠 Home</a></p>
+                    </body>
+                    </html>
+                    '''
+
+            else:
+                # Unknown /data/ endpoint
+                msg = '''
+                <html>
+                <body>
+                    <h2>❌ Unknown Data Endpoint</h2>
+                    <p>Available endpoints:</p>
+                    <ul>
+                        <li><a href="/data/stats">📈 Statistics</a></li>
+                        <li><a href="/data/view">👁️ View Transactions</a></li>
+                        <li><a href="/data/export">💾 Export Data</a></li>
+                    </ul>
                     <p><a href="/">🏠 Back to Home</a></p>
                 </body>
                 </html>
